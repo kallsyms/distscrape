@@ -3,3 +3,4 @@
 * Better HTTP error handling
     * Retry queue? Failed items set?
 * Exception handling
+* Stopping mid-crawl
