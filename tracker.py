@@ -17,27 +17,55 @@ class ItemTracker(object):
         # self.crawl_manager is set by the CrawlManager itself when it is initialized
 
     async def async_init(self):
+        """
+        Perform any late initialization asynchronously
+        """
         raise NotImplementedError()
 
     async def add_items(self, items: Iterable[str]):
+        """
+        Add `items` to the set of all known items, and add any items
+        not previously known to the set of unexplored items.
+        """
         raise NotImplementedError()
 
     async def mark_explored(self, items: Iterable[str]):
+        """
+        Mark `items` as explored.
+        """
         raise NotImplementedError()
 
     async def get_worker_id(self):
+        """
+        Create a new, unique worker id used for tracking what each
+        worker is currently assigned.
+        """
         raise NotImplementedError()
 
     async def crawl_done(self) -> bool:
+        """
+        Determine if the crawl is entirely finished.
+        """
         raise NotImplementedError()
 
     async def checkout_work(self, worker_id: int, n: int) -> Set[str]:
+        """
+        Checkout approximately `n` items to the given `worker_id`,
+        returning a set of all work the worker should do.
+        """
         raise NotImplementedError()
 
     async def mark_work_finished(self, worker_id: int, work: Set[str]):
+        """
+        Mark that the given `worker_id` has finished items in `work`.
+        """
         raise NotImplementedError()
 
     async def shutdown(self):
+        """
+        Method called when the Tracker is shutting down.
+        Useful to close sockets, files, etc.
+        """
         raise NotImplementedError()
 
 
@@ -60,8 +88,9 @@ class InMemoryTracker(ItemTracker):
         pass
 
     async def add_items(self, items):
-        self.all_items.update(items)
-        self.unexplored_items.update(self.all_items)
+        new_items = items - self.all_items
+        self.all_items.update(new_items)
+        self.unexplored_items.update(new_items)
 
     async def mark_explored(self, items):
         self.unexplored_items.difference_update(items)
@@ -113,32 +142,71 @@ class RedisTracker(ItemTracker):
         self._logger.info(f"Resetting worker id counter in {self._worker_id_key}")
         await self._redis.set(self._worker_id_key, 0)
 
+        self._logger.info(f"Resetting temporary id counter in {self._temp_id_key}")
+        await self._redis.set(self._temp_id_key, 0)
+
         for worker_k in await self._redis.keys(self._checked_out_work_key('*')):
             self._logger.info(f"Clearing items checked out by worker in {worker_k}")
             await self._redis.delete(worker_k)
 
     def _keyname(self, elem: str):
+        """
+        Return a key name for `elem` unique to this crawl.
+        """
         return f"{self.crawl_manager.name}_{elem}"
 
     @property
     def _items_key(self):
+        """
+        The set key used to store all known items.
+        """
         return self._keyname('all_items')
 
     @property
     def _unexplored_key(self):
+        """
+        The set key used to store all unexplored items.
+        """
         return self._keyname('unexplored')
 
     @property
     def _worker_id_key(self):
+        """
+        The counter key used to generate worker IDs.
+        """
         return self._keyname('worker_id')
 
+    @property
+    def _temp_id_key(self):
+        """
+        The counter key used to generate temporary set names.
+        """
+        return self._keyname('temp_id')
+
     def _checked_out_work_key(self, worker_id):
+        """
+        The set key used to store all items checked out to the given
+        `worker_id`.
+        """
         return self._keyname(f'checked_out_{worker_id}')
 
     async def add_items(self, items):
+        temp_id = await self._redis.incr(self._temp_id_key)
+        temp_key = self._keyname(f'temp_{temp_id}')
+
+        # Load all items we're adding into a temp table
         for some_items in grouper(1000, items):
-            await self._redis.sadd(self._items_key, *some_items)
-            await self._redis.sadd(self._unexplored_key, *some_items)
+            await self._redis.sadd(temp_key, *some_items)
+
+        # Find the new items (i.e. items not already in all_items)
+        await self._redis.sdiffstore(temp_key, temp_key, self._items_key)
+
+        # Save new items into all_items and unexplored
+        await self._redis.sunionstore(self._items_key, self._items_key, temp_key)
+        await self._redis.sunionstore(self._unexplored_key, self._unexplored_key, temp_key)
+
+        # And clean up after ourselves
+        await self._redis.delete(temp_key)
 
     async def mark_explored(self, items):
         for some_items in grouper(1000, items):
